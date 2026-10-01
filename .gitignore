@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.spec.tmp
+config.yaml
+*.db
+*.db-shm
+*.db-wal
+

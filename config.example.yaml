@@ -1,0 +1,56 @@
+instance:
+  name: "${INSTANCE_NAME}"
+  data_dir: "~/.ai-control"
+  log_level: INFO
+  max_parallel_tasks: 4
+
+telegram:
+  # Токен загружается из хранилища ОС или переменной AI_CONTROL_BOT_TOKEN.
+  allowed_user_ids: [123456789]
+  allow_groups: false
+  requests_per_minute: 30
+  progress_interval_seconds: 1.5
+
+projects:
+  - name: AI Control
+    path: C:\Projects\ai-control
+    runtime: windows
+    agents: [claude, codex, cursor]
+    # Начальный режим и максимальный доступ, который можно выбрать через Telegram.
+    # Варианты: read_only, project_only, approved_paths, full_access.
+    # Это начальный режим новой задачи. Пониженный через Telegram full_access
+    # не возвращается перезапуском: для полного доступа создайте новую задачу.
+    file_access: project_only
+    worktrees_enabled: true
+  - name: Linux Backend
+    path: /home/user/projects/backend
+    runtime: wsl
+    wsl_distribution: Ubuntu
+    agents: [claude, codex, cursor]
+    file_access: project_only
+    worktrees_enabled: true
+
+telegram_export:
+  approved_paths: []
+  max_file_size_mb: 45
+
+codex:
+  executable: codex
+  start_timeout_seconds: 20
+  turn_timeout_seconds: 3600
+  default_model: gpt-5.6-sol
+  models: [gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]
+
+claude:
+  executable: claude
+  start_timeout_seconds: 20
+  turn_timeout_seconds: 3600
+  default_model: opus
+  models: [opus, sonnet]
+
+cursor:
+  executable: agent
+  start_timeout_seconds: 20
+  turn_timeout_seconds: 3600
+  default_model: auto
+  models: [auto, composer-2.5, gpt-5.6-sol-high, claude-opus-5-thinking-high, gemini-3.7-flash-high, kimi-k3-max]

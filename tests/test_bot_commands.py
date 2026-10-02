@@ -1,7 +1,11 @@
 import json
+from unittest.mock import AsyncMock
+
+import pytest
+from aiogram.exceptions import TelegramBadRequest
 
 from ai_control.bot.commands import format_claude_usage, format_codex_usage
-from ai_control.bot.handlers import panic_confirmed
+from ai_control.bot.handlers import answer_callback, panic_confirmed
 
 
 def test_format_codex_usage() -> None:
@@ -36,3 +40,25 @@ def test_panic_requires_exact_confirmation() -> None:
     assert not panic_confirmed("/panic")
     assert not panic_confirmed("/panic stop")
     assert not panic_confirmed("/panic STOP now")
+
+
+@pytest.mark.asyncio
+async def test_answer_callback_ignores_expired_query() -> None:
+    query = AsyncMock()
+    query.data = "agent:codex"
+    query.answer.side_effect = TelegramBadRequest(
+        method=object(),
+        message="Bad Request: query is too old and response timeout expired or query ID is invalid",
+    )
+
+    await answer_callback(query)
+
+
+@pytest.mark.asyncio
+async def test_answer_callback_reraises_other_bad_requests() -> None:
+    query = AsyncMock()
+    query.data = "agent:codex"
+    query.answer.side_effect = TelegramBadRequest(method=object(), message="Bad Request: another error")
+
+    with pytest.raises(TelegramBadRequest):
+        await answer_callback(query)

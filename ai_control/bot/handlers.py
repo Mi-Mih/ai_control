@@ -8,6 +8,7 @@ from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -43,6 +44,22 @@ from ai_control.storage import Database
 
 CALLBACK_RE = re.compile(r"^[a-z]+:[A-Za-z0-9._~/-]{1,48}(?::[A-Za-z0-9._~-]{1,24})?$")
 logger = logging.getLogger(__name__)
+
+
+async def answer_callback(
+    query: CallbackQuery,
+    text: str | None = None,
+    *,
+    show_alert: bool | None = None,
+) -> None:
+    """Acknowledge callbacks without aborting a flow for an expired Telegram query."""
+    try:
+        await query.answer(text=text, show_alert=show_alert)
+    except TelegramBadRequest as exc:
+        detail = str(exc).casefold()
+        if "query is too old" not in detail and "query id is invalid" not in detail:
+            raise
+        logger.info("Ignoring expired callback query data=%r", query.data)
 
 
 def panic_confirmed(text: str) -> bool:
@@ -209,7 +226,7 @@ def create_router(
 
     @router.callback_query(F.data == "menu:new")
     async def new_task(query: CallbackQuery, state: FSMContext) -> None:
-        await query.answer()
+        await answer_callback(query)
         assert query.message
         items = await projects.list()
         if not items:
@@ -336,16 +353,16 @@ def create_router(
     async def choose_project(query: CallbackQuery, state: FSMContext) -> None:
         data = query.data or ""
         if not CALLBACK_RE.fullmatch(data):
-            await query.answer("Некорректные данные", show_alert=True)
+            await answer_callback(query, "Некорректные данные", show_alert=True)
             return
         identifier = data.split(":", 1)[1]
         project = await projects.get(identifier)
         if not project:
-            await query.answer("Проект не найден", show_alert=True)
+            await answer_callback(query, "Проект не найден", show_alert=True)
             return
         await state.update_data(project_id=identifier)
         await state.set_state(NewTask.agent)
-        await query.answer()
+        await answer_callback(query)
         assert query.message
         await query.message.answer("Выберите агента:", reply_markup=agent_list(project))
 
@@ -354,15 +371,15 @@ def create_router(
         try:
             agent = AgentKind((query.data or "").split(":", 1)[1])
         except (ValueError, IndexError):
-            await query.answer("Некорректный агент", show_alert=True)
+            await answer_callback(query, "Некорректный агент", show_alert=True)
             return
         models = tasks.available_models(agent)
         if not models:
-            await query.answer("Для агента не настроены модели", show_alert=True)
+            await answer_callback(query, "Для агента не настроены модели", show_alert=True)
             return
         await state.update_data(agent=agent.value)
         await state.set_state(NewTask.model)
-        await query.answer()
+        await answer_callback(query)
         assert query.message
         await query.message.answer(
             "Выберите модель:",
@@ -377,11 +394,11 @@ def create_router(
             index = int((query.data or "").split(":", 1)[1])
             model = tasks.available_models(agent)[index]
         except (ValueError, KeyError, IndexError):
-            await query.answer("Некорректная модель", show_alert=True)
+            await answer_callback(query, "Некорректная модель", show_alert=True)
             return
         await state.update_data(model=model)
         await state.set_state(NewTask.checkout)
-        await query.answer()
+        await answer_callback(query)
         assert query.message
         await query.message.answer("Где выполнять задачу?", reply_markup=checkout_choice())
 
@@ -389,7 +406,7 @@ def create_router(
     async def choose_checkout(query: CallbackQuery, state: FSMContext) -> None:
         await state.update_data(isolated=query.data == "checkout:isolated")
         await state.set_state(NewTask.prompt)
-        await query.answer()
+        await answer_callback(query)
         assert query.message
         await query.message.answer("Отправьте текст задания. Файлы можно добавить после создания задачи.")
 

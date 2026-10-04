@@ -278,7 +278,7 @@ class TaskManager:
                 record.status = TaskStatus.STOPPED
                 await self._set_status(record.id, record.status)
                 raise
-            except (AgentError, OSError, RuntimeError) as exc:
+            except (AgentError, OSError, RuntimeError, ValueError) as exc:
                 logger.exception("Task %s failed", record.id)
                 record.status = TaskStatus.FAILED
                 record.error = str(exc)

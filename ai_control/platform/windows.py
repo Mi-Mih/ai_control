@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -18,8 +19,11 @@ class WindowsPlatform(PlatformAdapter):
         cwd: Path,
         env: Mapping[str, str] | None = None,
     ) -> ManagedProcess:
+        # CreateProcess only appends ".exe", so npm shims like "claude.cmd" must be resolved via PATHEXT.
+        executable = shutil.which(argv[0]) or argv[0]
         process = await asyncio.create_subprocess_exec(
-            *argv,
+            executable,
+            *argv[1:],
             cwd=cwd,
             env=dict(env) if env else None,
             stdin=asyncio.subprocess.PIPE,

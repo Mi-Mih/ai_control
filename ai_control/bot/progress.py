@@ -9,13 +9,13 @@ from pathlib import Path
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.types import BufferedInputFile
 
+from ai_control.bot.formatting import MAX_MESSAGES, MESSAGE_LIMIT, markdown_to_html, split_markdown
 from ai_control.bot.keyboards import approval, task_actions
 from ai_control.config.models import AppConfig
 from ai_control.core.models import AgentEvent, TaskRecord
 from ai_control.security.redaction import redact
-
-FINAL_PREVIEW_LIMIT = 1200
 
 
 @dataclass(slots=True)
@@ -30,6 +30,7 @@ class ProgressState:
     last_activity: datetime | None = None
     last_update: float = 0
     last_rendered: str = ""
+    result_sent: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -96,13 +97,16 @@ class ProgressReporter:
                     body += f"\nПоследняя активность: {state.last_activity.strftime('%H:%M:%S')}"
             elif status == "завершена":
                 body += f"\nДлительность запуска: {_duration_text(now - state.started_at)}"
+            detail = "\n\n<pre>" + html.escape(state.detail) + "</pre>" if state.detail else ""
+            separate_result = False
             if state.response_text:
-                preview = state.response_text[:FINAL_PREVIEW_LIMIT]
-                if len(state.response_text) > len(preview):
-                    preview = preview.rstrip() + "\n…"
-                body += "\n\n<b>Итог:</b>\n" + html.escape(preview)
-            if state.detail:
-                body += "\n\n<pre>" + html.escape(state.detail) + "</pre>"
+                inline = "\n\n<b>Итог:</b>\n" + markdown_to_html(state.response_text)
+                if len(body) + len(inline) + len(detail) <= MESSAGE_LIMIT:
+                    body += inline
+                else:
+                    separate_result = True
+                    body += "\n\n<b>Итог</b> — полный ответ в следующих сообщениях ⬇️"
+            body += detail
             if body == state.last_rendered and not final:
                 return
             state.last_update = now
@@ -118,6 +122,9 @@ class ProgressReporter:
                 await asyncio.sleep(min(float(exc.retry_after), 5))
             except TelegramBadRequest:
                 pass
+            if separate_result and event.kind in {"completed", "error"} and not state.result_sent:
+                state.result_sent = True
+                await send_markdown(self.bot, state.chat_id, state.response_text, f"task-{task.id}-result")
 
     def _status(self, task: TaskRecord, status: str) -> str:
         return (
@@ -128,6 +135,28 @@ class ProgressReporter:
             f"Модель: {html.escape(task.model or 'по умолчанию')}\n"
             f"Состояние: {html.escape(status)}"
         )
+
+
+async def send_markdown(bot: Bot, chat_id: int, text: str, filename: str, title: str = "") -> None:
+    """Sends a Markdown answer as formatted messages, or as a file when it is too long.
+
+    Args:
+        bot: Telegram bot.
+        chat_id: Target chat.
+        text: Answer in Markdown, already redacted.
+        filename: File name without extension for the document fallback.
+        title: Optional HTML heading prepended to the first message.
+    """
+    chunks = split_markdown(text, MESSAGE_LIMIT - len(title) - 2)
+    if len(chunks) <= MAX_MESSAGES:
+        try:
+            for index, chunk in enumerate(chunks):
+                await bot.send_message(chat_id, f"{title}\n\n{chunk}" if title and index == 0 else chunk)
+            return
+        except TelegramBadRequest:
+            pass
+    document = BufferedInputFile(text.encode("utf-8"), filename=f"{filename}.md")
+    await bot.send_document(chat_id, document, caption=title or None)
 
 
 def _duration_text(seconds: float) -> str:

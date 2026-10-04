@@ -12,7 +12,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
+from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from ai_control.bot.commands import execute_task_command
 from ai_control.bot.keyboards import (
@@ -30,7 +30,7 @@ from ai_control.bot.keyboards import (
     task_actions,
     task_list,
 )
-from ai_control.bot.progress import ProgressReporter
+from ai_control.bot.progress import ProgressReporter, send_markdown
 from ai_control.config.models import AppConfig
 from ai_control.core.models import AgentKind, ApprovalMode, FileAccessMode, TaskRecord, TaskStatus
 from ai_control.files.policy import ExportPolicy, is_sensitive, safe_inbox_destination
@@ -723,11 +723,13 @@ def create_router(
             await query.answer("Итоговый ответ не найден", show_alert=True)
             return
         await query.answer()
-        if len(result) <= 3500:
-            await query.message.answer(f"<b>Результат задачи #{task_id}</b>\n\n{html.escape(result)}")
-        else:
-            document = BufferedInputFile(result.encode("utf-8"), filename=f"task-{task_id}-result.txt")
-            await query.message.answer_document(document, caption=f"Полный результат задачи #{task_id}")
+        await send_markdown(
+            query.message.bot,
+            query.message.chat.id,
+            result,
+            f"task-{task_id}-result",
+            title=f"<b>Результат задачи #{task_id}</b>",
+        )
 
     @router.callback_query(F.data.startswith("upload:"))
     async def request_upload(query: CallbackQuery, state: FSMContext) -> None:

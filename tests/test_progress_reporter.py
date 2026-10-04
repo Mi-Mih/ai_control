@@ -90,6 +90,41 @@ def test_progress_reporter_does_not_append_repeated_progress_to_answer(tmp_path:
     asyncio.run(scenario())
 
 
+def test_long_final_answer_is_sent_in_full_after_completion(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig.model_validate(
+            {
+                "instance": {"name": "Test", "data_dir": tmp_path},
+                "telegram": {"allowed_user_ids": [42]},
+            }
+        )
+        bot = FakeBot()
+        reporter = ProgressReporter(bot, config)  # type: ignore[arg-type]
+        task = TaskRecord(
+            id=4,
+            project_id="project",
+            user_id=42,
+            agent=AgentKind.CLAUDE,
+            status=TaskStatus.RUNNING,
+            checkout_path=tmp_path,
+            prompt="test",
+        )
+        reporter.bind(task.id, 100, 203)
+        answer = "\n\n".join(f"Абзац {index} " + "текст " * 50 for index in range(40))
+
+        await reporter(task, AgentEvent("final", answer))
+        assert bot.messages == []
+        await reporter(task, AgentEvent("completed"))
+        await reporter(task, AgentEvent("completed"))
+
+        assert "полный ответ в следующих сообщениях" in bot.edits[-1]
+        assert len(bot.messages) > 1
+        joined = "\n".join(bot.messages)
+        assert all(f"Абзац {index} " in joined for index in range(40))
+
+    asyncio.run(scenario())
+
+
 def test_approval_card_does_not_expose_command_or_content(tmp_path: Path) -> None:
     async def scenario() -> None:
         config = AppConfig.model_validate(

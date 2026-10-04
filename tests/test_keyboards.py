@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from ai_control.bot.keyboards import task_list
+from ai_control.bot.keyboards import task_actions, task_list
 from ai_control.core.models import AgentKind, TaskRecord, TaskStatus
 
 
@@ -52,3 +52,11 @@ def test_task_list_adds_pagination_controls() -> None:
         ["Назад"],
     ]
     assert [button.callback_data for button in keyboard.inline_keyboard[1]] == ["tasks:0", "tasks:2"]
+
+
+def test_task_actions_can_offer_full_result_on_demand() -> None:
+    keyboard = task_actions(19, show_result=True)
+
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    result = next(button for button in buttons if button.callback_data == "result:19")
+    assert result.text == "Полный результат"

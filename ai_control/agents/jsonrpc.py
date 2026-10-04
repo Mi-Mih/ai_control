@@ -7,6 +7,7 @@ from typing import Any
 
 from ai_control.agents.base import AgentError
 from ai_control.platform.base import ManagedProcess, PlatformAdapter
+from ai_control.security.redaction import redact
 
 
 class JsonRpcProcess:
@@ -53,7 +54,7 @@ class JsonRpcProcess:
                 else:
                     await self.notifications.put(message)
         finally:
-            error = AgentError("app-server closed: " + "".join(self._stderr[-8:]).strip())
+            error = AgentError("app-server closed: " + redact("".join(self._stderr[-8:]).strip()))
             for pending in self._pending.values():
                 if not pending.done():
                     pending.set_exception(error)
@@ -102,6 +103,12 @@ class JsonRpcProcess:
     async def close(self) -> None:
         if self.process:
             await self.platform.terminate_tree(self.process)
+            await self.process.wait()
         for task in (self._reader_task, self._stderr_task):
             if task:
                 task.cancel()
+        await asyncio.gather(
+            *(task for task in (self._reader_task, self._stderr_task) if task),
+            return_exceptions=True,
+        )
+        self.process = None

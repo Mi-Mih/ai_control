@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from ai_control.core.models import (
     Project,
     TaskRecord,
     TaskStatus,
+    utc_now,
 )
 from ai_control.git import GitService
 from ai_control.platform import PlatformAdapter
@@ -53,6 +55,7 @@ class TaskManager:
         self._adapters: dict[int, AgentAdapter] = {}
         self._checkout_owners: dict[str, int] = {}
         self._handlers: list[EventHandler] = []
+        self._activity_updates: dict[int, float] = {}
         self._guard = asyncio.Lock()
         self._shutting_down = False
 
@@ -239,6 +242,16 @@ class TaskManager:
                                 "UPDATE tasks SET agent_session_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                                 (event.session_id, record.id),
                             )
+                        if event.kind in {
+                            "progress",
+                            "status",
+                            "text_delta",
+                            "final",
+                            "approval",
+                            "policy_denied",
+                            "recovery",
+                        }:
+                            await self._touch_activity(record)
                         if event.kind == "approval":
                             record.status = TaskStatus.WAITING_APPROVAL
                             await self._set_status(record.id, record.status)
@@ -278,6 +291,7 @@ class TaskManager:
                 await adapter.stop()
                 self._adapters.pop(record.id, None)
                 self._runners.pop(record.id, None)
+                self._activity_updates.pop(record.id, None)
                 async with self._guard:
                     self._checkout_owners.pop(self._checkout_key(record.checkout_path), None)
 
@@ -629,6 +643,19 @@ class TaskManager:
         await self.database.execute(
             "UPDATE tasks SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (status.value, task_id),
+        )
+
+    async def _touch_activity(self, record: TaskRecord) -> None:
+        """Persist a heartbeat without writing SQLite for every streamed token."""
+        now = time.monotonic()
+        record.updated_at = utc_now()
+        previous = self._activity_updates.get(record.id, 0)
+        if now - previous < 1:
+            return
+        self._activity_updates[record.id] = now
+        await self.database.execute(
+            "UPDATE tasks SET updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (record.id,),
         )
 
     async def _emit(self, record: TaskRecord, event: AgentEvent) -> None:

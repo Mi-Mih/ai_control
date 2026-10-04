@@ -19,6 +19,24 @@ from ai_control.core.models import (
     FileAccessMode,
 )
 from ai_control.platform import PlatformAdapter
+from ai_control.security.redaction import redact
+
+_TEST_COMMAND_MARKERS = (
+    " pytest",
+    " py.test",
+    " unittest",
+    " npm test",
+    " npm run test",
+    " pnpm test",
+    " yarn test",
+    " cargo test",
+    " go test",
+    " dotnet test",
+    " gradle test",
+    " gradlew test",
+)
+_GIT_CHECK_MARKERS = (" git status", " git diff", " git show", " git log")
+_LEGACY_MESSAGE_LIMIT = 64_000
 
 
 class CodexAdapter(AgentAdapter):
@@ -44,6 +62,10 @@ class CodexAdapter(AgentAdapter):
         self.thread_id: str | None = None
         self.turn_id: str | None = None
         self._approval_requests: dict[str, int] = {}
+        self._active_items: dict[str, dict[str, Any]] = {}
+        self._agent_message_deltas: dict[str, str] = {}
+        self._last_agent_message = ""
+        self._final_answer_seen = False
 
     async def capabilities(self) -> CapabilityReport:
         executable = shutil.which(self.executable)
@@ -147,7 +169,7 @@ class CodexAdapter(AgentAdapter):
         finally:
             await rpc.close()
 
-    async def _connect(self, cwd: Path, session_id: str | None) -> str:
+    async def _connect(self, cwd: Path, session_id: str | None) -> tuple[str, bool]:
         self.rpc = JsonRpcProcess(self.platform, (self.executable, "app-server", "--listen", "stdio://"), cwd)
         await self.rpc.start()
         await self.rpc.request(
@@ -184,10 +206,22 @@ class CodexAdapter(AgentAdapter):
             }
             if self.model:
                 params["model"] = self.model
-            result = await self.rpc.request(
-                "thread/resume",
-                params,
-            )
+            try:
+                result = await self.rpc.request(
+                    "thread/resume",
+                    params,
+                )
+            except AgentError as exc:
+                # A forcibly interrupted Codex turn can occasionally leave one
+                # local thread unreadable even though app-server itself is
+                # healthy. Preserve the working tree and recover into a fresh
+                # thread instead of failing the whole Telegram task.
+                if "app-server closed" not in str(exc):
+                    raise
+                await self.rpc.close()
+                self.rpc = None
+                identifier, _ = await self._connect(cwd, None)
+                return identifier, True
         else:
             params = {
                 "cwd": str(cwd),
@@ -208,7 +242,7 @@ class CodexAdapter(AgentAdapter):
         if not identifier:
             raise AgentError("Codex did not return a thread ID")
         self.thread_id = str(identifier)
-        return self.thread_id
+        return self.thread_id, False
 
     async def run_turn(
         self,
@@ -218,8 +252,20 @@ class CodexAdapter(AgentAdapter):
         session_id: str | None = None,
         attachments: tuple[Path, ...] = (),
     ) -> AsyncIterator[AgentEvent]:
-        thread_id = await self._connect(cwd, session_id)
+        thread_id, recovered = await self._connect(cwd, session_id)
         yield AgentEvent("session", session_id=thread_id)
+        if recovered:
+            yield AgentEvent(
+                "recovery",
+                "Предыдущая сессия Codex не возобновилась; создана новая сессия "
+                "с сохранением текущих файлов проекта.",
+            )
+            prompt = (
+                "Предыдущая сессия Codex была прервана и не смогла возобновиться. "
+                "Продолжи работу по текущему состоянию файлов и git diff. Не откатывай "
+                "существующие изменения; проверь, что осталось незавершённым.\n\n"
+                f"Последнее сообщение пользователя:\n{prompt}"
+            )
         inputs: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for path in attachments:
             if path.suffix.casefold() in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
@@ -233,7 +279,11 @@ class CodexAdapter(AgentAdapter):
         result = await self.rpc.request("turn/start", turn_params, timeout_seconds=30)
         turn = result.get("turn", result)
         self.turn_id = str(turn.get("id") or turn.get("turnId") or "")
-        yield AgentEvent("status", "Codex turn started", payload={"turn_id": self.turn_id})
+        self._active_items.clear()
+        self._agent_message_deltas.clear()
+        self._last_agent_message = ""
+        self._final_answer_seen = False
+        yield AgentEvent("progress", "Начинает работу…", payload={"turn_id": self.turn_id})
 
         request_task = asyncio.create_task(self.rpc.requests.get())
         notification_task = asyncio.create_task(self.rpc.notifications.get())
@@ -263,16 +313,44 @@ class CodexAdapter(AgentAdapter):
                         method = note.get("method", "")
                         params = note.get("params", {})
                         if method == "item/agentMessage/delta":
-                            yield AgentEvent("text_delta", event_text(params), payload=params)
+                            delta = event_text(params)
+                            item_id = str(params.get("itemId") or "")
+                            if delta and item_id:
+                                accumulated = self._agent_message_deltas.get(item_id, "") + delta
+                                self._agent_message_deltas[item_id] = accumulated[-_LEGACY_MESSAGE_LIMIT:]
+                                active_item = self._active_items.get(item_id, {})
+                                if active_item.get("phase") != "commentary":
+                                    self._last_agent_message = self._agent_message_deltas[item_id]
+                            # Deltas are activity heartbeats only. The authoritative
+                            # completed agentMessage decides what appears as the result.
+                            yield AgentEvent("text_delta", delta, payload={"item_id": item_id})
+                        elif method == "item/completed" and _is_agent_message(params):
+                            item = params["item"]
+                            item_id = str(item.get("id") or "")
+                            text = str(item.get("text") or self._agent_message_deltas.pop(item_id, ""))
+                            self._active_items.pop(item_id, None)
+                            phase = item.get("phase")
+                            if phase == "final_answer":
+                                self._final_answer_seen = True
+                                if text:
+                                    yield AgentEvent("final", text, payload={"phase": phase, "item_id": item_id})
+                            elif phase is None and text:
+                                self._last_agent_message = text
                         elif method in {"turn/completed", "turn/failed"}:
+                            if not self._final_answer_seen and self._last_agent_message:
+                                yield AgentEvent(
+                                    "final",
+                                    self._last_agent_message,
+                                    payload={"phase": "unknown"},
+                                )
                             yield AgentEvent("completed", payload=params)
                             return
                         elif method in {"error", "turn/error"}:
                             yield AgentEvent("error", event_text(params), payload=params)
-                        elif method.endswith("/delta"):
-                            text = event_text(params)
-                            if text:
-                                yield AgentEvent("progress", text, payload=params)
+                        else:
+                            progress = _codex_progress_event(note, cwd, self._active_items)
+                            if progress:
+                                yield progress
                         notification_task = asyncio.create_task(self.rpc.notifications.get())
         except TimeoutError:
             await self.stop()
@@ -315,3 +393,119 @@ def _within(path: Path, root: Path) -> bool:
         return True
     except (OSError, ValueError):
         return False
+
+
+def _is_agent_message(params: Any) -> bool:
+    return (
+        isinstance(params, dict)
+        and isinstance(params.get("item"), dict)
+        and params["item"].get("type") == "agentMessage"
+    )
+
+
+def _codex_progress_event(
+    notification: dict[str, Any],
+    cwd: Path,
+    active_items: dict[str, dict[str, Any]] | None = None,
+) -> AgentEvent | None:
+    """Convert app-server tool lifecycle notifications without exposing tool data."""
+    method = str(notification.get("method") or "")
+    raw_params = notification.get("params")
+    params = raw_params if isinstance(raw_params, dict) else {}
+    raw_item = params.get("item")
+    item = raw_item if isinstance(raw_item, dict) else None
+    item_id = str(params.get("itemId") or (item or {}).get("id") or "")
+
+    if method == "item/started" and item:
+        if active_items is not None and item_id:
+            active_items[item_id] = item
+        text = _item_progress_text(item, cwd, completed=False)
+    elif method == "item/completed" and item:
+        text = _item_progress_text(item, cwd, completed=True)
+        if active_items is not None and item_id:
+            active_items.pop(item_id, None)
+    elif method == "item/fileChange/patchUpdated":
+        text = _file_change_text(params.get("changes"), cwd, completed=False)
+    elif method == "item/commandExecution/outputDelta":
+        known = active_items.get(item_id) if active_items is not None else None
+        text = _command_progress_text(known or {}, cwd, completed=False)
+    elif method == "item/mcpToolCall/progress":
+        text = "Выполняет MCP-вызов…"
+    else:
+        return None
+
+    if not text:
+        return None
+    # Only the synthesized description is retained. Raw command output, patches,
+    # arguments and environment data stay inside the adapter and are never logged.
+    return AgentEvent("progress", redact(text)[:240], payload={"method": method, "item_id": item_id})
+
+
+def _item_progress_text(item: dict[str, Any], cwd: Path, *, completed: bool) -> str | None:
+    item_type = item.get("type")
+    if item_type == "commandExecution":
+        return _command_progress_text(item, cwd, completed=completed)
+    if item_type == "fileChange":
+        return _file_change_text(item.get("changes"), cwd, completed=completed)
+    if item_type in {"mcpToolCall", "dynamicToolCall"}:
+        return "MCP-вызов завершён." if completed else "Выполняет MCP-вызов…"
+    if item_type == "webSearch":
+        return "Поиск в интернете завершён." if completed else "Ищет в интернете…"
+    if item_type == "imageView":
+        path = _display_path(item.get("path"), cwd)
+        return f"Чтение {path} завершено." if completed and path else "Читает файл…"
+    return None
+
+
+def _command_progress_text(item: dict[str, Any], cwd: Path, *, completed: bool) -> str:
+    raw_actions = item.get("commandActions")
+    actions = [action for action in raw_actions if isinstance(action, dict)] if isinstance(raw_actions, list) else []
+    action_types = {str(action.get("type") or "") for action in actions}
+    path = next((_display_path(action.get("path"), cwd) for action in actions if action.get("path")), None)
+
+    if "search" in action_types:
+        return "Поиск по проекту завершён." if completed else "Ищет по проекту…"
+    if action_types & {"read", "listFiles"}:
+        if completed:
+            return f"Чтение {path} завершено." if path else "Чтение файлов завершено."
+        return f"Читает {path}…" if path else "Читает файлы…"
+
+    # app-server's structured commandActions can be `unknown`; inspect the raw
+    # command only for classification and never include it in the emitted event.
+    command = f" {str(item.get('command') or '').casefold()} "
+    if any(marker in command for marker in _TEST_COMMAND_MARKERS):
+        return "Тесты завершены." if completed else "Запускает тесты…"
+    if any(marker in command for marker in _GIT_CHECK_MARKERS):
+        return "Проверка изменений Git завершена." if completed else "Проверяет изменения Git…"
+    return "Команда завершена." if completed else "Запускает команду…"
+
+
+def _file_change_text(changes: Any, cwd: Path, *, completed: bool) -> str:
+    path: str | None = None
+    if isinstance(changes, list):
+        for change in changes:
+            if isinstance(change, dict) and change.get("path"):
+                path = _display_path(change["path"], cwd)
+                break
+    if completed:
+        return f"Изменение {path} завершено." if path else "Изменение файлов завершено."
+    return f"Изменяет {path}…" if path else "Изменяет файлы…"
+
+
+def _display_path(value: Any, cwd: Path, *, max_length: int = 96) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    candidate = Path(raw)
+    try:
+        resolved = (
+            candidate.resolve(strict=False) if candidate.is_absolute() else (cwd / candidate).resolve(strict=False)
+        )
+        display = resolved.relative_to(cwd.resolve(strict=False)).as_posix()
+    except (OSError, ValueError):
+        parts = [part for part in raw.replace("\\", "/").split("/") if part]
+        display = "…/" + "/".join(parts[-2:]) if parts else "…"
+    display = redact(display.replace("\\", "/"))
+    if len(display) > max_length:
+        display = "…" + display[-(max_length - 1) :]
+    return display

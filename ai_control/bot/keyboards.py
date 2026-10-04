@@ -128,34 +128,35 @@ def task_list(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def task_actions(task_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Отправить сообщение", callback_data=f"continue:{task_id}"),
-                InlineKeyboardButton(text="Остановить", callback_data=f"stop:{task_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="Статус", callback_data=f"task:{task_id}"),
-                InlineKeyboardButton(text="Git diff", callback_data=f"diff:{task_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="Файлы", callback_data=f"files:{task_id}"),
-                InlineKeyboardButton(text="Загрузить", callback_data=f"upload:{task_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="Сменить модель", callback_data=f"taskmodel:{task_id}"),
-                InlineKeyboardButton(text="Доступ", callback_data=f"taskaccess:{task_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="Подтверждения", callback_data=f"taskapproval:{task_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="Закрыть задачу", callback_data=f"close:{task_id}"),
-            ],
+def task_actions(task_id: int, *, show_result: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="Отправить сообщение", callback_data=f"continue:{task_id}"),
+            InlineKeyboardButton(text="Остановить", callback_data=f"stop:{task_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="Статус", callback_data=f"task:{task_id}"),
+            InlineKeyboardButton(text="Git diff", callback_data=f"diff:{task_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="Файлы", callback_data=f"files:{task_id}"),
+            InlineKeyboardButton(text="Загрузить", callback_data=f"upload:{task_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="Сменить модель", callback_data=f"taskmodel:{task_id}"),
+            InlineKeyboardButton(text="Доступ", callback_data=f"taskaccess:{task_id}"),
+        ],
+        [InlineKeyboardButton(text="Подтверждения", callback_data=f"taskapproval:{task_id}")],
+    ]
+    if show_result:
+        rows.append([InlineKeyboardButton(text="Полный результат", callback_data=f"result:{task_id}")])
+    rows.extend(
+        [
+            [InlineKeyboardButton(text="Закрыть задачу", callback_data=f"close:{task_id}")],
             [InlineKeyboardButton(text="Назад", callback_data="menu:tasks")],
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def access_choice(

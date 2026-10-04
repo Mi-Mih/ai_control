@@ -3,14 +3,35 @@ from pathlib import Path
 
 import pytest
 
+from ai_control.agents.base import AgentAdapter
 from ai_control.config.models import AppConfig
-from ai_control.core.models import AgentKind, ApprovalMode, FileAccessMode
+from ai_control.core.models import AgentEvent, AgentKind, ApprovalMode, CapabilityReport, FileAccessMode
 from ai_control.git import GitService
 from ai_control.platform import current_platform
 from ai_control.projects import ProjectRegistry
 from ai_control.sessions import TaskManager
 from ai_control.sessions.manager import TaskManagerError
 from ai_control.storage import Database
+
+
+class ProgressThenCompleteAdapter(AgentAdapter):
+    async def capabilities(self) -> CapabilityReport:
+        return CapabilityReport(True, "test", "test")
+
+    async def run_turn(
+        self,
+        prompt: str,
+        *,
+        cwd: Path,
+        session_id: str | None = None,
+        attachments: tuple[Path, ...] = (),
+    ):  # type: ignore[no-untyped-def]
+        yield AgentEvent("progress", "Запускает тесты…")
+        yield AgentEvent("text_delta", "Готово")
+        yield AgentEvent("completed")
+
+    async def stop(self) -> None:
+        return None
 
 
 def test_schema_and_recovery(tmp_path: Path) -> None:
@@ -184,5 +205,44 @@ def test_task_approval_mode_changes_only_between_runs_and_is_audited(tmp_path: P
         await database.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
         with pytest.raises(TaskManagerError, match="task is running"):
             await manager.change_approval_mode(task_id, 42, ApprovalMode.MANUAL)
+
+    asyncio.run(scenario())
+
+
+def test_progress_updates_activity_and_task_still_completes(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        database = Database(tmp_path / "state.db")
+        await database.initialize()
+        await database.execute(
+            "INSERT INTO projects(id,name,path,runtime,agents_json,file_access) VALUES(?,?,?,?,?,?)",
+            ("p", "Project", str(tmp_path), "linux", '["codex"]', "project_only"),
+        )
+        task_id = await database.execute(
+            "INSERT INTO tasks(project_id,user_id,agent,status,checkout_path,prompt,updated_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            ("p", 42, "codex", "running", str(tmp_path), "test", "2000-01-01 00:00:00"),
+        )
+        config = AppConfig.model_validate(
+            {
+                "instance": {"name": "Test", "data_dir": tmp_path / "data"},
+                "telegram": {"allowed_user_ids": [42]},
+            }
+        )
+        manager = TaskManager(config, database, ProjectRegistry(database), current_platform(), GitService())
+        record = await manager.get(task_id)
+        assert record
+
+        await manager._touch_activity(record)
+        active_row = await database.fetch_one("SELECT updated_at FROM tasks WHERE id=?", (task_id,))
+        assert active_row and active_row["updated_at"] != "2000-01-01 00:00:00"
+
+        adapter = ProgressThenCompleteAdapter()
+        manager._adapter = lambda *args, **kwargs: adapter  # type: ignore[method-assign]
+        await manager._run(record, "test", ())
+
+        completed = await manager.get(task_id)
+        assert completed and completed.status.value == "completed"
+        messages = await database.fetch_all("SELECT kind,content FROM messages WHERE task_id=? ORDER BY id", (task_id,))
+        assert [message["kind"] for message in messages] == ["progress", "text_delta", "completed"]
 
     asyncio.run(scenario())

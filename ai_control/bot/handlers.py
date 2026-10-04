@@ -12,7 +12,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
 
 from ai_control.bot.commands import execute_task_command
 from ai_control.bot.keyboards import (
@@ -38,6 +38,7 @@ from ai_control.files.service import file_sha256
 from ai_control.git import GitService
 from ai_control.permissions import PermissionService
 from ai_control.projects import ProjectRegistry
+from ai_control.security.redaction import redact
 from ai_control.sessions import TaskManager
 from ai_control.sessions.manager import TaskManagerError
 from ai_control.storage import Database
@@ -478,7 +479,10 @@ def create_router(
         if record.error:
             text += "\nОшибка: " + html.escape(record.error)
         await state.update_data(active_task_id=record.id)
-        await query.message.answer(text, reply_markup=task_actions(task_id))
+        await query.message.answer(
+            text,
+            reply_markup=task_actions(task_id, show_result=record.status == TaskStatus.COMPLETED),
+        )
 
     @router.callback_query(F.data.startswith("taskaccess:"))
     async def task_access(query: CallbackQuery) -> None:
@@ -688,6 +692,42 @@ def create_router(
         else:
             for start in range(0, len(diff), 3500):
                 await query.message.answer("<pre>" + html.escape(diff[start : start + 3500]) + "</pre>")
+
+    @router.callback_query(F.data.startswith("result:"))
+    async def task_result(query: CallbackQuery) -> None:
+        assert query.message and query.from_user
+        try:
+            task_id = int((query.data or "").split(":", 1)[1])
+        except ValueError:
+            await query.answer("Некорректная задача", show_alert=True)
+            return
+        record = await tasks.get(task_id)
+        if not record or record.user_id != query.from_user.id:
+            await query.answer("Задача не найдена", show_alert=True)
+            return
+        row = await database.fetch_one(
+            "SELECT content FROM messages WHERE task_id=? AND kind='final' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        result = str(row["content"]) if row and row.get("content") else ""
+        if not result:
+            # Compatibility for tasks completed before final-answer events were
+            # stored separately. This fallback is only sent on explicit request.
+            rows = await database.fetch_all(
+                "SELECT content FROM messages WHERE task_id=? AND kind='text_delta' ORDER BY id",
+                (task_id,),
+            )
+            result = "".join(str(item["content"]) for item in rows)
+        result = redact(result).strip()
+        if not result:
+            await query.answer("Итоговый ответ не найден", show_alert=True)
+            return
+        await query.answer()
+        if len(result) <= 3500:
+            await query.message.answer(f"<b>Результат задачи #{task_id}</b>\n\n{html.escape(result)}")
+        else:
+            document = BufferedInputFile(result.encode("utf-8"), filename=f"task-{task_id}-result.txt")
+            await query.message.answer_document(document, caption=f"Полный результат задачи #{task_id}")
 
     @router.callback_query(F.data.startswith("upload:"))
     async def request_upload(query: CallbackQuery, state: FSMContext) -> None:

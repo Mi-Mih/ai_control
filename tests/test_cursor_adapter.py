@@ -100,12 +100,64 @@ def test_cursor_acp_protocol_model_and_resume(tmp_path: Path) -> None:
 
         assert events[0].session_id == "existing-session"
         assert any(event.kind == "text_delta" and event.text == "hello" for event in events)
+        assert any(event.kind == "final" and event.text == "hello" for event in events)
         assert events[-1].kind == "completed"
         assert platform.argv == ("agent", "--model", "composer-2.5", "--sandbox", "enabled", "acp")
         assert platform.process is not None
         messages = platform.process.stdin.messages
         assert all(message.get("jsonrpc") == "2.0" for message in messages)
         assert any(message.get("method") == "session/load" for message in messages)
+        await adapter.stop()
+
+    asyncio.run(scenario())
+
+
+def test_cursor_combines_message_chunks_into_final_answer(tmp_path: Path) -> None:
+    class ChunkedWriter(FakeWriter):
+        def write(self, data: bytes) -> None:
+            message = json.loads(data)
+            if message.get("method") != "session/prompt":
+                super().write(data)
+                return
+
+            self.messages.append(message)
+            for text in ("Привет", ", мир!"):
+                update = {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": message["params"]["sessionId"],
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": text},
+                        },
+                    },
+                }
+                self.output.feed_data((json.dumps(update) + "\n").encode())
+            result = {"stopReason": "end_turn"}
+            self.output.feed_data(
+                (json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}) + "\n").encode()
+            )
+
+    class ChunkedProcess(FakeProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stdin = ChunkedWriter(self.stdout)
+
+    class ChunkedPlatform(FakePlatform):
+        async def spawn(self, argv, *, cwd, env=None):  # type: ignore[no-untyped-def]
+            self.argv = tuple(argv)
+            self.process = ChunkedProcess()
+            return self.process  # type: ignore[return-value]
+
+    async def scenario() -> None:
+        adapter = CursorAdapter(ChunkedPlatform(), executable="agent")
+
+        events = [event async for event in adapter.run_turn("hello", cwd=tmp_path)]
+
+        assert [event.text for event in events if event.kind == "text_delta"] == ["Привет", ", мир!"]
+        assert [event.text for event in events if event.kind == "final"] == ["Привет, мир!"]
+        assert events[-1].kind == "completed"
         await adapter.stop()
 
     asyncio.run(scenario())

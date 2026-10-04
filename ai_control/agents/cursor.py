@@ -193,6 +193,7 @@ class CursorAdapter(AgentAdapter):
         )
         request_task = asyncio.create_task(self.rpc.requests.get())
         notification_task = asyncio.create_task(self.rpc.notifications.get())
+        response_chunks: list[str] = []
         try:
             while True:
                 done, _ = await asyncio.wait(
@@ -208,10 +209,26 @@ class CursorAdapter(AgentAdapter):
                     note = notification_task.result()
                     event = self._notification_event(note)
                     if event:
+                        if event.kind == "text_delta":
+                            response_chunks.append(event.text)
                         yield event
                     notification_task = asyncio.create_task(self.rpc.notifications.get())
                 if prompt_task in done:
                     result = prompt_task.result()
+                    # The prompt response can be resolved in the same event-loop
+                    # iteration as the last session/update notifications. Drain
+                    # those queued chunks before constructing the final answer.
+                    if not notification_task.done():
+                        notification_task.cancel()
+                    while not self.rpc.notifications.empty():
+                        event = self._notification_event(self.rpc.notifications.get_nowait())
+                        if event:
+                            if event.kind == "text_delta":
+                                response_chunks.append(event.text)
+                            yield event
+                    response_text = "".join(response_chunks).strip()
+                    if response_text:
+                        yield AgentEvent("final", response_text, payload=result)
                     yield AgentEvent("completed", payload=result)
                     return
         except TimeoutError:
